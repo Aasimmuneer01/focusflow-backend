@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions for authentication and authorization
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (
+        ('admin' in request.auth.token && request.auth.token.admin == true) ||
+        ('role' in request.auth.token && request.auth.token.role == 'admin') ||
+        (request.auth.token.email != null && (
+          request.auth.token.email == 'mahnoormuneer4999@gmail.com' ||
+          request.auth.token.email == 'admin@focusflow.com' ||
+          request.auth.token.email.matches('.*admin.*')
+        ))
+      );
+    }
+
+    // 1. User profiles and private user data
+    match /users/{userId} {
+      // User can read and write their own profile; admins have administrative access
+      allow read: if isOwner(userId) || isAdmin();
+      allow write: if isOwner(userId) || isAdmin();
+
+      // AI Study Assistant Chats
+      // Allows listing chats ordered by updatedAt, getting chat details, creating, updating, deleting
+      match /aiChats/{chatId} {
+        allow read, write: if isOwner(userId);
+
+        // AI Study Assistant Messages subcollection
+        // Allows listing messages ordered by createdAt, creating user messages, writing assistant responses
+        match /messages/{messageId} {
+          allow read, write: if isOwner(userId);
+        }
+      }
+
+      // Bookmarked resources
+      match /bookmarks/{resourceId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // User reading and study history
+      match /history/{historyId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Study planner tasks
+      match /studyTasks/{taskId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Study sessions (focus timer logs)
+      match /studySessions/{sessionId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Smart revision items (spaced repetition)
+      match /revisionItems/{itemId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // User devices (push notification FCM tokens)
+      match /devices/{deviceId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // FocusFlow Coins: owner can read, nobody on the client can write (Cloud Functions only)
+      match /wallet/{walletId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+      match /coinTransactions/{txId} {
+        allow read: if isOwner(userId);
+        allow write: if false;
+      }
+      match /coinRequests/{requestId} {
+        allow read, write: if false;
+      }
+    }
+
+    // 2. Study Categories (Curriculum, Subjects, Classes)
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // 3. Study Resources (PDFs, Notes, Past Papers)
+    match /resources/{resourceId} {
+      allow read: if true;
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        isAuthenticated() &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewsCount', 'downloadsCount', 'views', 'downloads', 'updatedAt'])
+      );
+    }
+
+    // 4. Community Chat Rooms and Messages
+    match /chats/{chatId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+
+      match /messages/{messageId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated() && request.resource.data.senderId == request.auth.uid;
+        allow update, delete: if isAdmin() || (isAuthenticated() && resource.data.senderId == request.auth.uid);
+      }
+    }
+
+    // 5. In-App Update Configuration
+    match /app_config/{document=**} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // 6. Global Website and App Control Settings
+    match /website_control/{document=**} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+  }
+}
