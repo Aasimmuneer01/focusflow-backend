@@ -5,6 +5,8 @@
 //   FIREBASE_API_KEY               secret  Firebase Web API key, used to verify ID tokens.
 //                                          FIREBASE_WEB_API_KEY is accepted as an alias.
 //   FIREBASE_PROJECT_ID            var     Optional. Defaults to resourceswebsite-4871a.
+//   UNITY_S2S_SECRET               secret  Random secret (at least 32 chars) for the reward callback.
+//   PDF_TOKEN_SECRET               secret  Random secret (at least 32 chars) for short-lived PDF tokens.
 //
 // Security model:
 // - Every wallet route needs "Authorization: Bearer <Firebase ID token>". Google verifies the token.
@@ -13,7 +15,7 @@
 // - Balances change only inside Firestore transactions, and only through this Worker.
 // - Charges and refunds are keyed by requestId, so retries cannot charge or refund twice.
 
-export const PRICES = Object.freeze({ view: 30, download: 50, share: 60 });
+export const PRICES = Object.freeze({ view: 30, download: 65, share: 75 });
 
 const DEFAULT_PROJECT_ID = "resourceswebsite-4871a";
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
@@ -23,6 +25,7 @@ const HISTORY_DEFAULT = 20;
 const HISTORY_MAX = 50;
 const DATASTORE_SCOPE = "https://www.googleapis.com/auth/datastore";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
+const TOKEN_TTL_SECONDS = 5 * 60;
 const LOOKUP_URL = "https://identitytoolkit.googleapis.com/v1/accounts:lookup";
 const FIRESTORE_ROOT = "https://firestore.googleapis.com/v1";
 // Firestore codes that mean "another request changed the data first": retry from a fresh read.
@@ -56,6 +59,8 @@ export function resolveConfig(env = {}) {
     projectId: env.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID,
     apiKey: env.FIREBASE_API_KEY || env.FIREBASE_WEB_API_KEY || "",
     serviceAccountJson: env.FIREBASE_SERVICE_ACCOUNT_JSON || "",
+    unityS2sSecret: env.UNITY_S2S_SECRET || "",
+    pdfTokenSecret: env.PDF_TOKEN_SECRET || "",
   };
 }
 
@@ -289,6 +294,131 @@ export async function runTransaction(fs, fn) {
     }
   }
   throw new ContentionError("transaction contention");
+}
+
+// ---------- signed PDF access tokens and Unity reward callback ----------
+
+function constantTimeEqual(a, b) {
+  const x = new TextEncoder().encode(String(a));
+  const y = new TextEncoder().encode(String(b));
+  if (x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+async function hmacBytes(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  return new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message)));
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function makePdfToken(secret, payload) {
+  const encoded = b64urlString(JSON.stringify(payload));
+  return `${encoded}.${bytesToHex(await hmacBytes(secret, encoded))}`;
+}
+
+async function verifyPdfToken(secret, token) {
+  if (!secret || typeof token !== "string" || token.length > 2048) return null;
+  const dot = token.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const encoded = token.slice(0, dot);
+  const supplied = token.slice(dot + 1);
+  const expected = bytesToHex(await hmacBytes(secret, encoded));
+  if (!constantTimeEqual(supplied, expected)) return null;
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(encoded.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((encoded.length + 3) % 4)), c => c.charCodeAt(0))));
+    if (!payload || !Number.isInteger(payload.exp) || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    if (typeof payload.uid !== "string" || typeof payload.resourceId !== "string") return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+export async function handlePdfAccessToken(request, deps) {
+  const uid = await authenticate(request, deps);
+  if (!uid) return json(401, { ok: false, error: "unauthenticated" });
+  if (!deps.pdfTokenSecret || deps.pdfTokenSecret.length < 32) {
+    throw new ConfigError("PDF_TOKEN_SECRET must be configured with at least 32 characters");
+  }
+  const body = await readJson(request);
+  if (!body || typeof body.resourceId !== "string" || !RESOURCE_ID_RE.test(body.resourceId)) {
+    return json(400, { ok: false, error: "invalid_resource" });
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const token = await makePdfToken(deps.pdfTokenSecret, {
+    uid, resourceId: body.resourceId, iat: now, exp: now + TOKEN_TTL_SECONDS,
+  });
+  return json(200, { ok: true, token, expiresIn: TOKEN_TTL_SECONDS, resourceId: body.resourceId });
+}
+
+// Validates a short-lived token. PDF storage/delivery must be connected separately;
+// this endpoint intentionally does not fetch arbitrary URLs or expose private storage.
+export async function handlePdfDeliver(request, deps) {
+  if (!deps.pdfTokenSecret || deps.pdfTokenSecret.length < 32) {
+    throw new ConfigError("PDF_TOKEN_SECRET must be configured with at least 32 characters");
+  }
+  const body = await readJson(request);
+  const payload = body && await verifyPdfToken(deps.pdfTokenSecret, body.token);
+  if (!payload) return json(401, { ok: false, error: "invalid_or_expired_token" });
+  return json(501, {
+    ok: false,
+    error: "pdf_storage_not_configured",
+    message: "Token validated. Configure a private PDF storage source before enabling file delivery.",
+    resourceId: payload.resourceId,
+  });
+}
+
+export async function handleUnityRewardCallback(request, deps) {
+  if (!deps.unityS2sSecret || deps.unityS2sSecret.length < 32) {
+    throw new ConfigError("UNITY_S2S_SECRET must be configured with at least 32 characters");
+  }
+  const supplied = request.headers.get("x-unity-secret") || "";
+  if (!constantTimeEqual(supplied, deps.unityS2sSecret)) {
+    return json(401, { ok: false, error: "invalid_callback_secret" });
+  }
+  const body = await readJson(request);
+  if (!body || typeof body.uid !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.uid)) {
+    return json(400, { ok: false, error: "invalid_uid" });
+  }
+  const rewardId = body.rewardId;
+  if (typeof rewardId !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(rewardId)) {
+    return json(400, { ok: false, error: "invalid_reward_id" });
+  }
+  // Reward amount is server-defined; callers cannot choose the number of coins.
+  const rewardAmount = 25;
+  const uid = body.uid;
+  const wallet = `users/${uid}/wallet/main`;
+  const txPath = `users/${uid}/coinTransactions/unity_${rewardId}`;
+  const result = await runTransaction(deps.firestore, async (fs, txId) => {
+    const [walletFields, existingTx] = await fs.batchGet([wallet, txPath], txId);
+    if (existingTx) {
+      return { status: 200, body: { ok: true, idempotent: true, rewarded: false, amount: 0 }, writes: [] };
+    }
+    const balance = walletBalance(walletFields);
+    const newBalance = balance + rewardAmount;
+    if (!Number.isSafeInteger(newBalance)) {
+      return { status: 409, body: { ok: false, error: "wallet_balance_overflow" }, writes: [] };
+    }
+    const now = Date.now();
+    const writes = [];
+    if (walletFields) writes.push(balanceWrite(wallet, newBalance, now));
+    else writes.push({ path: wallet, precondition: "mustNotExist", fields: {
+      balance: intValue(newBalance), createdAt: intValue(now), updatedAt: intValue(now), schemaVersion: intValue(1),
+    }});
+    writes.push({ path: txPath, precondition: "mustNotExist", fields: {
+      type: strValue("rewarded_ad"), action: strValue("unity_reward"), amount: intValue(rewardAmount),
+      rewardId: strValue(rewardId), balanceAfter: intValue(newBalance), createdAt: intValue(now),
+    }});
+    return { status: 200, body: { ok: true, idempotent: false, rewarded: true, amount: rewardAmount, balance: newBalance }, writes };
+  });
+  return json(result.status, result.body);
 }
 
 // ---------- paths ----------
@@ -618,6 +748,8 @@ export function makeProdDeps(env, fetchFn = fetch) {
   const cfg = resolveConfig(env);
   return {
     verifyIdToken: (idToken) => verifyIdToken(idToken, cfg.apiKey, fetchFn),
+    unityS2sSecret: cfg.unityS2sSecret,
+    pdfTokenSecret: cfg.pdfTokenSecret,
     firestore: makeFirestoreRest({
       projectId: cfg.projectId,
       getAccessToken: () => getServiceAccessToken(cfg.serviceAccountJson, fetchFn),
@@ -633,6 +765,9 @@ const ROUTES = {
   "/spend-coins": handleSpend,
   "/refund-coins": handleRefund,
   "/transactions": handleTransactions,
+  "/unity-reward-callback": handleUnityRewardCallback,
+  "/pdf-access-token": handlePdfAccessToken,
+  "/pdf-deliver": handlePdfDeliver,
 };
 
 export async function route(request, deps) {
